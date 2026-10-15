@@ -87,7 +87,7 @@ app.use(
     store: store,
     cookie: {
       maxAge: 1000 * 60 * 60 * 24,
-      sameSite: "lax",
+      sameSite: isProduction ? "none" : "lax",
       httpOnly: true,
       secure: isProduction,
       path: "/",
