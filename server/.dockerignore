@@ -1,9 +1,0 @@
-node_modules
-npm-debug.log
-.env
-.git
-uploads
-.DS_Store
-.vscode
-dist
-build

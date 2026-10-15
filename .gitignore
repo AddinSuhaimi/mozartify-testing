@@ -15,7 +15,6 @@ dist-ssr
 .env
 .env.development
 .env.production
-.env.docker
 .env.local
 !.env.*.example
 
