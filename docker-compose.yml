@@ -1,0 +1,178 @@
+version: '3.9'
+
+services:
+  # ===== INFRASTRUCTURE =====
+  mongo:
+    image: mongo:4.4
+    container_name: mozartify-mongo
+    restart: always
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: mozartify
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - mozartify-network
+    healthcheck:
+      test: ["CMD", "mongo", "--quiet", "--eval", "db.adminCommand('ping').ok", "localhost:27017/mozartify"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: mozartify-redis
+    restart: always
+    volumes:
+      - redis_data:/data
+    networks:
+      - mozartify-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===== BACKEND MONOLITH =====
+  # Phase 1: Runs all modules from server/modules
+  # Phase 3+: Will be replaced by individual service containers
+  backend:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: mozartify-backend
+    restart: always
+    ports:
+      - "10000:10000"
+    env_file:
+      - ./server/.env.docker
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./server:/app
+      - /app/node_modules
+      - ./server/uploads:/app/uploads
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - mozartify-network
+    environment:
+      - NODE_ENV=production
+      - MONGO_URI=mongodb://mongo:27017/mozartify
+      - REDIS_URI=redis://redis:6379
+      - PYTHONUNBUFFERED=1
+      - AUDIVERIS_SERVICE_URL=http://audiveris-service:8080/convert
+      - FASTAPI_EMOTION_URL=http://emotion-ai:8002/predict-emotion
+      - FASTAPI_GENDER_URL=http://gender-ai:8003/predict-gender
+      - FASTAPI_GENRE_URL=http://genre-ai:8001/predict-genre
+    labels:
+      - "com.mozartify.service=backend-monolith"
+      - "com.mozartify.phase=1"
+      - "com.mozartify.note=Will be split into microservices in Phase 3"
+
+  # ===== FRONTEND =====
+  # Vite React application served via Nginx
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL}
+    container_name: mozartify-frontend
+    restart: always
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    networks:
+      - mozartify-network
+    labels:
+      - "com.mozartify.service=frontend"
+      - "com.mozartify.phase=1"
+
+  # ===== AUDIVERIS OCR SERVICE =====
+  audiveris-service:
+    build:
+      context: ./audiveris-service
+      dockerfile: Dockerfile
+    container_name: mozartify-audiveris
+    restart: always
+    expose:
+      - "8080"
+    volumes:
+      - ./audiveris-service/uploads:/app/uploads
+      - ./audiveris-service/output:/app/output
+    networks:
+      - mozartify-network
+    environment:
+      - NODE_ENV=development
+      - PORT=8080
+      - AUDIVERIS_COMMAND=audiveris
+      - AUDIVERIS_TIMEOUT_MS=180000
+    labels:
+      - "com.mozartify.service=audiveris"
+      - "com.mozartify.phase=2"
+
+  # ===== FASTAPI AI SERVICES =====
+  genre-ai:
+    build:
+      context: ./fastapi-server
+      dockerfile: Dockerfile
+    container_name: mozartify-genre-ai
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      SERVICE_MODULE: genre
+      PORT: 8001
+      TF_ENABLE_ONEDNN_OPTS: "0"
+    networks:
+      - mozartify-network
+    platform: linux/amd64
+
+  emotion-ai:
+    build:
+      context: ./fastapi-server
+      dockerfile: Dockerfile
+    container_name: mozartify-emotion-ai
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    environment:
+      SERVICE_MODULE: emotion
+      PORT: 8002
+      TF_ENABLE_ONEDNN_OPTS: "0"
+    networks:
+      - mozartify-network
+    platform: linux/amd64
+
+  gender-ai:
+    build:
+      context: ./fastapi-server
+      dockerfile: Dockerfile
+    container_name: mozartify-gender-ai
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    environment:
+      SERVICE_MODULE: gender
+      PORT: 8003
+      TF_ENABLE_ONEDNN_OPTS: "0"
+    networks:
+      - mozartify-network
+    platform: linux/amd64
+
+networks:
+  mozartify-network:
+    driver: bridge
+
+volumes:
+  mongo_data:
+    driver: local
+  redis_data:
+    driver: local

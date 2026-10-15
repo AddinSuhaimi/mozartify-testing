@@ -1,0 +1,176 @@
+import os
+import warnings
+import traceback
+warnings.filterwarnings("ignore")
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import requests
+import numpy as np
+from tensorflow.keras.models import load_model
+import librosa
+from pydub import AudioSegment
+import io
+import random
+import uvicorn
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://0.0.0.0:5173",
+        "http://host.docker.internal",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "emotion"}
+
+
+# Load models once to avoid reloading them on every request
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+model_spec_path = os.path.join(
+    BASE_DIR,
+    "model",
+    "emotion",
+    "Conv2D_spec_agumented.h5"
+)
+
+model_mfcc_path = os.path.join(
+    BASE_DIR,
+    "model",
+    "emotion",
+    "Conv2D_mfcc_agumented.h5"
+)
+
+model_mel_path = os.path.join(
+    BASE_DIR,
+    "model",
+    "emotion",
+    "Conv2D_mel_agumented.h5"
+)
+
+try:
+    model_spec = load_model(model_spec_path)
+    model_mfcc = load_model(model_mfcc_path)
+    model_mel = load_model(model_mel_path)
+    print("Models loaded successfully.")
+except Exception as e:
+    print("Error loading models. Please check the paths and model files:", e)
+    raise
+
+class FileUrlRequest(BaseModel):
+    fileUrl: str
+
+def audioPreprocessing(file_content):
+    try:
+        audio = AudioSegment.from_file(io.BytesIO(file_content), format="mp3")
+    except Exception:
+        audio = AudioSegment.from_file(io.BytesIO(file_content))
+
+    audio = audio.set_frame_rate(22050)
+    audio = audio.set_channels(1)
+    samples = np.array(audio.get_array_of_samples()).astype(np.float32) / 32768
+    arr = librosa.resample(y=samples, orig_sr=audio.frame_rate, target_sr=11025)
+    return arr
+
+def moodString(f_pred):
+    emotions = ["Angry", "Happy", "Relaxed", "Sad"]
+    return emotions[f_pred] if f_pred < len(emotions) else "Unknown"
+
+def feature2d(y, sr):
+    stft = librosa.stft(y)
+    stft_db = librosa.amplitude_to_db(abs(stft))
+    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
+    mel = librosa.amplitude_to_db(librosa.feature.melspectrogram(y=y, sr=sr), ref=np.max)
+    return stft_db, mfccs, mel
+
+def majority_vote(preds):
+    counts = np.bincount(preds)
+    max_count = np.max(counts)
+    top_classes = np.where(counts == max_count)[0]
+    # Randomly select from the top classes in case of a tie
+    return random.choice(top_classes)
+
+def prediction2d(file_content):
+    arr = audioPreprocessing(file_content)
+    f_spec, f_mfcc, f_mel = feature2d(arr, 22050)
+
+    # Resize features for model input
+    f_spec_resized = np.resize(f_spec, (300, 300))
+    f_mfcc_resized = np.resize(f_mfcc, (600, 120))
+    f_mel_resized = np.resize(f_mel, (400, 300))
+
+    # Reshape data for models
+    f_spec_reshaped = f_spec_resized.reshape((1, 300, 300, 1))
+    f_mfcc_reshaped = f_mfcc_resized.reshape((1, 120, 600, 1))
+    f_mel_reshaped = f_mel_resized.reshape((1, 300, 400, 1))
+
+    print("Input shapes:", f_spec_reshaped.shape, f_mfcc_reshaped.shape, f_mel_reshaped.shape)
+
+    # Predictions from each model
+    y_prob1 = model_spec.predict(f_spec_reshaped)
+    y_prob2 = model_mfcc.predict(f_mfcc_reshaped)
+    y_prob3 = model_mel.predict(f_mel_reshaped)
+
+    print("Raw predictions from the Spectrogram model (model_spec):", y_prob1)
+    print("Raw predictions from the MFCC model (model_mfcc):", y_prob2)
+    print("Raw predictions from the Mel Spectrogram model (model_mel):", y_prob3)
+
+    # Extract predicted classes
+    y_pred1 = np.argmax(y_prob1, axis=-1)
+    y_pred2 = np.argmax(y_prob2, axis=-1)
+    y_pred3 = np.argmax(y_prob3, axis=-1)
+
+    print("Predicted classes (emotion labels) from each model:", y_pred1, y_pred2, y_pred3)
+
+    # Use majority vote function to get the final prediction
+    final_prediction = majority_vote([y_pred1[0], y_pred2[0], y_pred3[0]])
+    print(f"Final prediction after majority vote: {final_prediction}")
+
+    return moodString(final_prediction)
+
+print("Reached route registration")
+
+@app.post("/predict-emotion")
+async def predict_from_url(request: FileUrlRequest):
+    try:
+        fileUrl = request.fileUrl or getattr(request, "file_url", None)
+        if not fileUrl:
+            raise HTTPException(status_code=400, detail="No file URL provided.")
+        print("Received file URL for prediction:", fileUrl)
+        
+        # Download the file from Firebase using the provided URL
+        response = requests.get(fileUrl)
+        response.raise_for_status()  # Check if the download was successful
+
+        print("Successfully downloaded the audio file.")
+
+        # Process and predict from the downloaded content
+        pred = prediction2d(response.content)
+        print(f"Prediction result: {pred}")
+
+        return JSONResponse(content={
+            "predicted_mood": pred
+        })
+
+    except requests.exceptions.RequestException as e:
+        print("Error downloading file from Firebase:", e)
+        raise HTTPException(status_code=500, detail=f"Error downloading file from Firebase: {e}")
+    except Exception as e:
+        print("Error during prediction:")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error during prediction: {type(e).__name__}: {e}")
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8002)

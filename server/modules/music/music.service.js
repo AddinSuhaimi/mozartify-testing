@@ -1,0 +1,843 @@
+const ABCFileModel = require("../../models/ABCFile");
+const DeletedABCFile = require("../../models/deletedABCFile");
+const CartModel = require("../../models/Cart");
+const MusicDynamicField = require("../../models/MusicDynamicField");
+const MusicTab = require("../../models/MusicTab");
+const fs = require("fs");
+const path = require("path");
+const { exec, execFile } = require("child_process");
+const mongoose = require("mongoose");
+const axios = require("axios");
+const FormData = require("form-data");
+const sizeOf = require("image-size");
+const uploadService = require("../../shared/upload/upload.service");
+
+// Audiveris needs a reasonably high-resolution scan (~300 DPI) to detect staff lines reliably.
+const MIN_SCORE_IMAGE_LONG_EDGE_PX = 1500;
+const RASTER_EXTENSIONS = [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"];
+
+const buildMusicQuery = (combinedQueries, selectedCollection, queryText, filters) => {
+  let conditions = [];
+
+  // simple search
+  if (queryText && queryText.trim() !== "") {
+    conditions.push({
+      $or: [
+        { title: { $regex: queryText, $options: "i" } },
+        { genre: { $regex: queryText, $options: "i" } },
+        { composer: { $regex: queryText, $options: "i" } },
+        { instrumentation: { $regex: queryText, $options: "i" } },
+        { emotion: { $regex: queryText, $options: "i" } },
+      ],
+    });
+  }
+
+  // advanced search
+  if (combinedQueries) {
+    combinedQueries.forEach((row) => {
+      if (!row.searchCategory || !row.searchText) return;
+
+      let fieldMap = {
+        Title: "title",
+        Genre: "genre",
+        Composer: "composer",
+        Instrumentation: "instrumentation",
+        Emotion: "emotion",
+      };
+
+      if (row.searchCategory === "All") {
+        conditions.push({
+          $or: Object.values(fieldMap).map((field) => ({
+            [field]: { $regex: row.searchText, $options: "i" },
+          })),
+        });
+      } else {
+        const field = fieldMap[row.searchCategory];
+        conditions.push({
+          [field]: { $regex: row.searchText, $options: "i" },
+        });
+      }
+    });
+  }
+
+  // filters
+  if (filters) {
+    const { genre, composer, instrumentation, emotion } = filters;
+
+    if (genre) {
+      conditions.push({ genre });
+    }
+
+    if (composer) {
+      conditions.push({
+        composer: { $regex: composer, $options: "i" },
+      });
+    }
+
+    if (instrumentation) {
+      conditions.push({
+        instrumentation: { $regex: instrumentation, $options: "i" },
+      });
+    }
+
+    if (emotion) {
+      conditions.push({
+        emotion: { $regex: emotion, $options: "i" },
+      });
+    }
+  }
+
+  if (selectedCollection && selectedCollection !== "All") {
+    conditions.push({ collection: selectedCollection });
+  }
+
+  if (conditions.length === 1) return conditions[0];
+  if (conditions.length > 1) return { $and: conditions };
+
+  return {};
+};
+
+exports.getMusicRefineSearch = async () => {
+  const composers = await ABCFileModel.distinct("composer");
+  const genres = await ABCFileModel.distinct("genre");
+  const emotions = await ABCFileModel.distinct("emotion");
+  const instrumentation = await ABCFileModel.distinct("instrumentation");
+
+  return { composers, genres, emotions, instrumentation };
+};
+
+exports.searchMusic = async (body) => {
+  const { combinedQueries, selectedCollection, query: queryText, filters } = body;
+
+  const mongoQuery = buildMusicQuery(
+    combinedQueries,
+    selectedCollection,
+    queryText,
+    filters
+  );
+
+  return await ABCFileModel.find(mongoQuery);
+};
+
+exports.checkPurchase = async ({ score_id, user_id }) => {
+  if (!score_id || !user_id) {
+    throw new Error("Missing score_id or user_id");
+  }
+
+  const PurchaseModel = require("../../models/Purchase");
+  const purchases = await PurchaseModel.find({ score_id, user_id });
+
+  if (purchases.length > 0) {
+    return { exists: true, data: purchases };
+  } else {
+    return { exists: false, data: [] };
+  }
+};
+
+exports.getUserMusicCart = async (userId) => {
+  const cart = await CartModel.findOne({ user_id: userId });
+
+  if (!cart || cart.score_ids.length === 0) {
+    return [];
+  }
+
+  return cart.score_ids.map((scoreId) => ({
+    score_id: scoreId,
+  }));
+};
+
+exports.getMusicScoreById = async (scoreId) => {
+  const musicScore = await ABCFileModel.findById(scoreId);
+
+  if (!musicScore) {
+    throw new Error("Music score not found");
+  }
+
+  return musicScore;
+};
+
+exports.getMusicScoresByIds = async (scoreIds) => {
+  if (!scoreIds || scoreIds.length === 0) {
+    throw new Error("No score IDs provided");
+  }
+
+  const musicScores = await ABCFileModel.find({
+    _id: { $in: scoreIds },
+  });
+
+  if (musicScores.length === 0) {
+    throw new Error("No music scores found");
+  }
+
+  return musicScores;
+};
+
+exports.getPopularMusicScores = async () => {
+  const popularScores = await ABCFileModel.find()
+    .sort({ downloads: -1 })
+    .limit(10);
+
+  return popularScores;
+};
+
+exports.getUserLikedMusicScores = async (userId) => {
+  const UserModel = require("../../models/User");
+  const user = await UserModel.findById(userId);
+
+  if (!user || !user.favorites_music || user.favorites_music.length === 0) {
+    throw new Error("No liked scores found");
+  }
+
+  const likedScores = await ABCFileModel.find({
+    _id: { $in: user.favorites_music },
+  });
+
+  return likedScores;
+};
+
+exports.addToCart = async (userId, musicScoreId) => {
+  let cart = await CartModel.findOne({ user_id: userId });
+
+  if (!cart) {
+    cart = new CartModel({
+      user_id: userId,
+      score_ids: [musicScoreId],
+    });
+  } else {
+    // safer comparison for ObjectId vs string
+    if (!cart.score_ids.some(id => id.toString() === musicScoreId)) {
+      cart.score_ids.push(musicScoreId);
+    }
+  }
+
+  await cart.save();
+};
+
+exports.removeFromCart = async (userId, scoreId) => {
+  const cart = await CartModel.findOneAndUpdate(
+    { user_id: userId },
+    { $pull: { score_ids: scoreId } },
+    { new: true }
+  );
+
+  if (!cart) {
+    throw new Error("Cart not found");
+  }
+
+  return cart;
+};
+
+exports.setFavoritesMusic = async (userId, musicScoreId, action) => {
+  const UserModel = require("../../models/User");
+  const mongoose = require("mongoose");
+
+  if (!mongoose.Types.ObjectId.isValid(musicScoreId)) {
+    throw new Error("Invalid musicScoreId format");
+  }
+
+  const user = await UserModel.findById(userId);
+  if (!user) {
+    throw new Error("User not found");
+  }
+
+  if (action === "add") {
+    if (!user.favorites_music.includes(musicScoreId)) {
+      user.favorites_music.push(musicScoreId);
+    }
+  } else if (action === "remove") {
+    user.favorites_music = user.favorites_music.filter(
+      (favId) => favId.toString() !== musicScoreId
+    );
+  } else {
+    throw new Error("Invalid action specified");
+  }
+
+  await user.save();
+
+  return {
+    message: "Favorite updated successfully",
+    favorites_music: user.favorites_music,
+  };
+};
+
+const buildFallbackAbcContent = (filename) => {
+  const title = path.parse(filename).name || "Imported Score";
+  return `X:1\nT:${title}\nM:4/4\nL:1/4\nQ:1/4=120\nK:C\nV:1\n"${title}" z4\n`;
+};
+
+const isAudiverisInput = (filename) => {
+  const ext = path.extname(filename || "").toLowerCase();
+  return [...RASTER_EXTENSIONS, ".pdf"].includes(ext);
+};
+
+// Screenshots/low-res photos have too few pixels per staff line for Audiveris to detect them
+// (it logs e.g. "too low interline value ... picture resolution is too low") and silently
+// produce zero output instead of a hard error, so we catch this before wasting an OMR run.
+const checkImageResolution = (inputFilePath, filename) => {
+  const ext = path.extname(filename || "").toLowerCase();
+  if (!RASTER_EXTENSIONS.includes(ext)) {
+    return;
+  }
+
+  let dimensions;
+  try {
+    dimensions = sizeOf(inputFilePath);
+  } catch (error) {
+    console.warn("Could not read image dimensions for resolution check:", error.message);
+    return;
+  }
+
+  const longEdge = Math.max(dimensions.width || 0, dimensions.height || 0);
+  if (longEdge > 0 && longEdge < MIN_SCORE_IMAGE_LONG_EDGE_PX) {
+    const lowResError = new Error(
+      `Uploaded image is only ${dimensions.width}x${dimensions.height}px, which is too low-resolution for OMR. ` +
+      `Please upload a scan of at least ${MIN_SCORE_IMAGE_LONG_EDGE_PX}px on the longest side (ideally a 300 DPI scan), ` +
+      `not a screenshot or downscaled photo.`
+    );
+    lowResError.statusCode = 422;
+    lowResError.code = "IMAGE_RESOLUTION_TOO_LOW";
+    throw lowResError;
+  }
+};
+
+exports.processMusicUpload = async (file) => {
+  const inputFilePath = path.join(
+    __dirname,
+    "../../uploads",
+    file.filename
+  );
+
+  const outputDir = path.join(
+    __dirname,
+    "../../uploads",
+    `${path.parse(file.filename).name}`
+  );
+
+  const mxlFilePath = path.join(
+    outputDir,
+    `${path.parse(file.filename).name}.mxl`
+  );
+
+  const abcFilePath = path.join(
+    outputDir,
+    `${path.parse(file.filename).name}.abc`
+  );
+
+  await fs.promises.mkdir(outputDir, {
+    recursive: true,
+  });
+
+  if (fs.existsSync(inputFilePath)) {
+    checkImageResolution(inputFilePath, file.filename);
+  }
+
+  const execPromise = (command) => {
+    return new Promise((resolve, reject) => {
+      exec(command, (error, stdout, stderr) => {
+        if (stdout) {
+          console.log("STDOUT:");
+          console.log(stdout);
+        }
+
+        if (stderr) {
+          console.log("STDERR:");
+          console.log(stderr);
+        }
+
+        if (error) {
+          reject(error);
+        } else {
+          resolve(stdout);
+        }
+      });
+    });
+  };
+
+  let data = null;
+  let usedFallback = false;
+  let audiverisErrorMessage = "";
+  let audiverisFailure = null;
+
+  const audiverisServiceUrl = process.env.AUDIVERIS_SERVICE_URL || "http://audiveris-service:8080/convert";
+  const inputFileExists = fs.existsSync(inputFilePath);
+
+  if (inputFileExists) {
+    console.log(`Sending file to Audiveris service: ${inputFilePath}`);
+
+    try {
+      const form = new FormData();
+      form.append("file", fs.createReadStream(inputFilePath), {
+        filename: file.filename,
+        contentType: "application/octet-stream",
+      });
+
+      const response = await axios.post(audiverisServiceUrl, form, {
+        headers: {
+          ...form.getHeaders(),
+        },
+        timeout: 120000,
+      });
+
+      if (response?.data?.success && response.data.abc) {
+        data = response.data.abc;
+        await fs.promises.writeFile(abcFilePath, data, "utf8");
+      } else {
+        throw new Error(response?.data?.error || "Audiveris service returned no ABC content");
+      }
+    } catch (error) {
+      const serviceData = error.response?.data;
+      const serviceDiagnostics = serviceData?.diagnostics || null;
+      const serviceUserMessage = serviceData?.userMessage;
+      const serviceError = serviceData?.error;
+      const combinedErrorMessage = serviceUserMessage || serviceError || error.message;
+
+      audiverisFailure = {
+        code: serviceData?.code || "AUDIVERIS_REQUEST_FAILED",
+        message: combinedErrorMessage,
+        diagnostics: serviceDiagnostics,
+      };
+      audiverisErrorMessage = combinedErrorMessage;
+
+      console.warn("Audiveris service call failed, using fallback ABC content:", {
+        message: combinedErrorMessage,
+        code: audiverisFailure.code,
+        diagnostics: serviceDiagnostics,
+      });
+    }
+  } else {
+    console.warn("Uploaded file was not saved to disk; using fallback ABC content.");
+  }
+
+  if (!data) {
+    const pythonScript = path.join(
+      __dirname,
+      "./xml2abc.py"
+    );
+
+    if (fs.existsSync(mxlFilePath)) {
+      const abcCommand = `python "${pythonScript}" -o "${outputDir}" "${mxlFilePath}"`;
+
+      try {
+        await execPromise(abcCommand);
+        data = await fs.promises.readFile(abcFilePath, "utf8");
+      } catch (error) {
+        console.warn("Python MusicXML conversion failed, using fallback ABC content:", error.message);
+      }
+    }
+  }
+
+  if (!data) {
+    if (isAudiverisInput(file.filename)) {
+      const ocrError = new Error(
+        `Music score OCR could not detect a readable score in ${file.filename}. ${audiverisErrorMessage || "Audiveris service did not produce ABC output."}`
+      );
+      ocrError.statusCode = 422;
+      ocrError.code = audiverisFailure?.code || "OCR_CONVERSION_FAILED";
+      ocrError.details = audiverisFailure?.diagnostics || null;
+      throw ocrError;
+    }
+
+    data = buildFallbackAbcContent(file.filename);
+    usedFallback = true;
+    await fs.promises.writeFile(abcFilePath, data, "utf8");
+  }
+
+  const abcFile = new ABCFileModel({
+    filename: file.filename,
+    content: data,
+    title: path.parse(file.filename).name,
+  });
+
+  console.log("Saving ABC document:", {
+    filename: file.filename,
+    usedFallback,
+  });
+
+  let persisted = false;
+  try {
+    await abcFile.save();
+    persisted = true;
+  } catch (dbError) {
+    console.warn("Failed to persist ABC document to MongoDB, but the file upload pipeline completed:", dbError.message);
+  }
+
+  return {
+    abcId: persisted ? String(abcFile._id) : null,
+    filePath: `/uploads/${file.filename}`,
+
+    mxlFilePath: `/uploads/${
+      path.parse(file.filename).name
+    }/${
+      path.parse(file.filename).name
+    }.mxl`,
+
+    abcFilePath: `/uploads/${
+      path.parse(file.filename).name
+    }/${
+      path.parse(file.filename).name
+    }.abc`,
+
+    message: usedFallback
+      ? "File uploaded successfully; fallback ABC notation was generated because OCR conversion could not be completed"
+      : "File uploaded and processed successfully",
+    persistedToDatabase: persisted,
+  };
+};
+
+const execPromise = (command) => {
+  return new Promise(
+    (resolve, reject) => {
+      exec(
+        command,
+        (error, stdout, stderr) => {
+          if (error) { return reject(error); }
+          resolve(stdout);
+        }
+      );
+    }
+  );
+};
+
+// ABC File Management Functions
+exports.getABCFiles = async (sortOrder = "desc", sortBy = "_id") => {
+  const mongoSortOrder = sortOrder === "asc" ? 1 : -1;
+
+  const abcFiles = await ABCFileModel.find({ deleted: false }).sort({
+    [sortBy]: mongoSortOrder,
+  });
+
+  return abcFiles;
+};
+
+exports.getABCFileByIdentifier = async (identifier) => {
+  const rawIdentifier = typeof identifier === "string" ? identifier : "";
+  const candidateValues = [rawIdentifier, rawIdentifier.trim()];
+
+  for (const candidate of [...candidateValues]) {
+    if (!candidate) continue;
+    candidateValues.push(candidate.replace(/\+/g, " "));
+    try {
+      candidateValues.push(decodeURIComponent(candidate));
+    } catch (error) {
+      // Ignore malformed URL encoding and keep the raw value.
+    }
+  }
+
+  const uniqueCandidates = [...new Set(candidateValues.filter(Boolean))];
+
+  let abcFile = null;
+  console.log("Requested identifier:", identifier);
+
+  for (const candidate of uniqueCandidates) {
+    if (mongoose.Types.ObjectId.isValid(candidate)) {
+      abcFile = await ABCFileModel.findById(candidate);
+    } else {
+      abcFile = await ABCFileModel.findOne({ filename: candidate }).sort({ _id: -1 });
+    }
+
+    if (abcFile) {
+      console.log("Mongo result:", abcFile);
+      return abcFile;
+    }
+  }
+
+  console.log("Mongo result: null");
+  throw new Error("File not found");
+};
+
+exports.updateABCFileContent = async (identifier, content) => {
+  const rawIdentifier = typeof identifier === "string" ? identifier : "";
+  const candidateValues = [rawIdentifier, rawIdentifier.trim()];
+
+  for (const candidate of [...candidateValues]) {
+    if (!candidate) continue;
+    candidateValues.push(candidate.replace(/\+/g, " "));
+    try {
+      candidateValues.push(decodeURIComponent(candidate));
+    } catch (error) {
+      // Ignore malformed URL encoding and keep the raw value.
+    }
+  }
+
+  const uniqueCandidates = [...new Set(candidateValues.filter(Boolean))];
+
+  let abcFile = null;
+
+  for (const candidate of uniqueCandidates) {
+    if (mongoose.Types.ObjectId.isValid(candidate)) {
+      abcFile = await ABCFileModel.findByIdAndUpdate(candidate, { content }, { new: true });
+    } else {
+      const latest = await ABCFileModel.findOne({ filename: candidate }).sort({ _id: -1 });
+      if (latest) {
+        abcFile = await ABCFileModel.findByIdAndUpdate(latest._id, { content }, { new: true });
+      }
+    }
+
+    if (abcFile) {
+      return abcFile;
+    }
+  }
+
+  throw new Error("File not found");
+};
+
+exports.getCatalogByFilename = async (filename) => {
+  const rawFilename = typeof filename === "string" ? filename : "";
+  const candidateValues = [rawFilename, rawFilename.trim()];
+
+  for (const candidate of [...candidateValues]) {
+    if (!candidate) continue;
+    candidateValues.push(candidate.replace(/\+/g, " "));
+    try {
+      candidateValues.push(decodeURIComponent(candidate));
+    } catch (error) {
+      // Ignore malformed URL encoding and keep the raw value.
+    }
+  }
+
+  const uniqueCandidates = [...new Set(candidateValues.filter(Boolean))];
+
+  for (const candidate of uniqueCandidates) {
+    const catalogData = mongoose.Types.ObjectId.isValid(candidate)
+      ? await ABCFileModel.findById(candidate)
+      : await ABCFileModel.findOne({ filename: candidate }).sort({ _id: -1 });
+    if (catalogData) {
+      return catalogData;
+    }
+  }
+
+  throw new Error("File not found");
+};
+
+exports.saveCatalogMetadata = async (filename, metadata) => {
+  if (!filename) {
+    throw new Error("Filename is required");
+  }
+
+  // Never allow the identifier used to look up the record to be overwritten by the request body.
+  const { filename: _ignoredFilename, ...safeMetadata } = metadata || {};
+
+  const latest = mongoose.Types.ObjectId.isValid(filename)
+    ? await ABCFileModel.findById(filename)
+    : await ABCFileModel.findOne({ filename }).sort({ _id: -1 });
+  const abcFile = latest
+    ? await ABCFileModel.findByIdAndUpdate(latest._id, safeMetadata, { new: true, strict: false })
+    : null;
+
+  if (!abcFile) {
+    throw new Error("File not found");
+  }
+
+  return abcFile;
+};
+
+exports.deleteAndTransferABCFile = async (filename) => {
+  // Find the original file
+  const originalFile = await ABCFileModel.findOne({ filename });
+
+  if (!originalFile) {
+    throw new Error("File not found");
+  }
+
+  // Create a new document in the DeletedABCFile collection
+  const deletedFile = new DeletedABCFile({
+    ...originalFile.toObject(),
+    dateUploaded: originalFile.dateUploaded || new Date(),
+    deleted: true,
+    downloads: originalFile.downloads || 0,
+    downloadEvents: originalFile.downloadEvents || [],
+  });
+
+  // Save the file to the deleted collection
+  await deletedFile.save();
+
+  // Remove the original document
+  await ABCFileModel.findOneAndDelete({ filename });
+
+  return deletedFile;
+};
+
+exports.uploadCoverImage = async (file) => {
+
+  const fileUrl =
+    await uploadService.uploadFileToFirebase(
+      file,
+      "cover_images"
+    );
+
+  return fileUrl;
+};
+
+exports.uploadMp3 = async (file) => {
+
+  const fileUrl =
+    await uploadService.uploadFileToFirebase(
+      file,
+      "mp3_file"
+    );
+
+  return fileUrl;
+};
+
+// ========== MUSIC DYNAMIC FIELD SERVICE FUNCTIONS ==========
+
+exports.getMusicDynamicFields = async (showInactive = false) => {
+  const query = showInactive ? {} : { isActive: true };
+  return await MusicDynamicField.find(query).sort({
+    tabId: 1,
+    displayOrder: 1,
+  });
+};
+
+exports.getMusicDynamicFieldById = async (fieldId) => {
+  const field = await MusicDynamicField.findById(fieldId);
+  if (!field) {
+    throw new Error("Dynamic field not found");
+  }
+  return field;
+};
+
+exports.createMusicDynamicField = async (fieldData) => {
+  const newField = new MusicDynamicField(fieldData);
+  const savedField = await newField.save();
+  return savedField;
+};
+
+exports.updateMusicDynamicField = async (fieldId, fieldData) => {
+  const updatedField = await MusicDynamicField.findByIdAndUpdate(
+    fieldId,
+    fieldData,
+    { new: true, runValidators: true }
+  );
+  if (!updatedField) {
+    throw new Error("Dynamic field not found");
+  }
+  return updatedField;
+};
+
+exports.deactivateMusicDynamicField = async (fieldId) => {
+  const field = await MusicDynamicField.findByIdAndUpdate(
+    fieldId,
+    { isActive: false },
+    { new: true }
+  );
+  if (!field) {
+    throw new Error("Dynamic field not found");
+  }
+  return { message: "Dynamic field deactivated successfully" };
+};
+
+exports.getMusicDynamicFieldsByTabId = async (tabId) => {
+  const fields = await MusicDynamicField.find({
+    tabId: tabId,
+    isActive: true,
+  }).sort({ displayOrder: 1 });
+  return fields;
+};
+
+// ========== MUSIC TAB SERVICE FUNCTIONS ==========
+
+exports.getAllMusicTabs = async () => {
+  const tabs = await MusicTab.find({}).sort({ displayOrder: 1 });
+  return tabs;
+};
+
+exports.getMusicTabById = async (tabId) => {
+  const tab = await MusicTab.findOne({ tabId: tabId });
+  if (!tab) {
+    throw new Error("Tab not found");
+  }
+  return tab;
+};
+
+exports.createMusicTab = async (tabData) => {
+  // Find the highest tabId to ensure uniqueness
+  const highestTab = await MusicTab.findOne().sort("-tabId");
+  const nextTabId = highestTab ? highestTab.tabId + 1 : 0;
+
+  // Find the highest displayOrder to add the new tab at the end
+  const lastTab = await MusicTab.findOne().sort("-displayOrder");
+  const nextDisplayOrder = lastTab ? lastTab.displayOrder + 1 : 0;
+
+  const newTab = new MusicTab({
+    ...tabData,
+    tabId: nextTabId,
+    displayOrder: nextDisplayOrder,
+  });
+
+  const savedTab = await newTab.save();
+  return savedTab;
+};
+
+exports.updateMusicTab = async (tabId, tabData) => {
+  const updatedTab = await MusicTab.findOneAndUpdate(
+    { tabId: tabId },
+    tabData,
+    { new: true, runValidators: true }
+  );
+  if (!updatedTab) {
+    throw new Error("Tab not found");
+  }
+  return updatedTab;
+};
+
+exports.deleteMusicTab = async (tabId) => {
+  // Check if there are any fields in this tab
+  const fieldsInTab = await MusicDynamicField.countDocuments({
+    tabId: tabId,
+    isActive: true,
+  });
+
+  if (fieldsInTab > 0) {
+    throw new Error("Cannot delete tab with fields. Please move or deactivate fields first.");
+  }
+
+  const deletedTab = await MusicTab.findOneAndDelete({ tabId: tabId });
+
+  if (!deletedTab) {
+    throw new Error("Tab not found");
+  }
+
+  return { message: "Tab deleted successfully" };
+};
+
+exports.reorderMusicTabs = async (tabs) => {
+  if (!Array.isArray(tabs)) {
+    throw new Error("Invalid request format. Expected array of tabs.");
+  }
+
+  // Update each tab's display order
+  const updatePromises = tabs.map((tab, index) =>
+    MusicTab.findOneAndUpdate(
+      { tabId: tab.tabId },
+      { displayOrder: index },
+      { new: true }
+    )
+  );
+
+  const updatedTabs = await Promise.all(updatePromises);
+  return updatedTabs;
+};
+
+exports.initializeDefaultMusicTabs = async () => {
+  const existingTabs = await MusicTab.countDocuments();
+
+  if (existingTabs > 0) {
+    throw new Error("Tabs are already initialized");
+  }
+
+  const defaultTabs = [
+    { tabId: 0, name: "Identification", displayOrder: 0 },
+    { tabId: 1, name: "Creators", displayOrder: 1 },
+    { tabId: 2, name: "Dates", displayOrder: 2 },
+    { tabId: 3, name: "Content", displayOrder: 3 },
+    { tabId: 4, name: "Format", displayOrder: 4 },
+    { tabId: 5, name: "Rights", displayOrder: 5 },
+    { tabId: 6, name: "Geography", displayOrder: 6 },
+    { tabId: 7, name: "Performance", displayOrder: 7 },
+    { tabId: 8, name: "Related Work", displayOrder: 8 },
+  ];
+
+  await MusicTab.insertMany(defaultTabs);
+  return { message: "Default tabs initialized successfully" };
+};

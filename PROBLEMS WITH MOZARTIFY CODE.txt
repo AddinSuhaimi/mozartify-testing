@@ -1,0 +1,633 @@
+Phase 1 (now)
+- modular monolith
+- clean architecture
+- add recommendation service
+Phase 2
+- split into microservices
+- add service calls
+Phase 3
+- deploy as pods
+- introduce artificial dependencies
+- test scheduling
+
+PROBLEMS WITH MOZARTIFY CODE
+
+1) API endpoints are not modularized, all are clumped into few files
+
+Problem:
+Most routes are defined inside a few large files (e.g., `index.js`, `server.js`, `admin.js`), where each route handles:
+request handling + business logic + database operations + response formatting
+
+This causes:
+- very large, hard-to-read files
+- tight coupling between logic and routing
+- duplicated logic across different routes
+- difficult debugging, no clear separation of concerns
+- high risk of breaking unrelated features during changes
+- poor scalability when adding new features
+
+Solution:
+Refactor into a modular architecture:
+router → controller → service → model
+- Router: defines endpoints and middleware
+- Controller: handles request/response logic
+- Service: contains business logic and data processing
+- Model: handles database schema and queries (Mongoose)
+
+Modules:
+auth - authentication & session management
+user - user data & profile management
+music - music score domain
+arts - artwork domain
+notification - user notifications & inbox
+payment - transactions & purchases
+
+2) Some code blocks are using MongoClient while others use Mongoose
+
+Problem:
+The system mixes two different database access approaches:
+MongoClient (native driver)
+Mongoose (ODM with models)
+
+This causes:
+- duplicated database connections
+- inconsistent data handling (raw documents vs schema-based models)
+- lack of validation and schema enforcement in MongoClient usage
+- harder debugging due to mixed paradigms
+- increased complexity in maintaining queries
+- inconsistent coding style across the system
+
+Solution:
+Standardize all database operations using Mongoose models:
+- replace `MongoClient` queries with:
+Model.find()
+Model.findById()
+Model.updateOne()
+Model.findByIdAndUpdate()
+- ensure all collections are accessed through defined schemas
+
+What it does for the system:
+- unifies database access into a single consistent approach
+- ensures schema validation and data integrity
+- reduces duplicate connection handling
+- simplifies query logic and improves readability
+- makes debugging and maintenance easier
+
+3) Mongoose Model Re-compilation Error (OverwriteModelError)
+
+Problem:
+When refactoring into modules, multiple files import the same Mongoose model (e.g., `Artwork`, `User`, etc.).
+Mongoose tries to compile the same model multiple times, resulting in:
+
+OverwriteModelError: Cannot overwrite `ModelName` model once compiled
+
+This causes:
+- application startup to fail partially
+- some modules/routes not being registered
+- misleading `404 Route not found` errors
+- inconsistent system behavior despite correct routing code
+
+Solution:
+Modify all model exports to reuse existing compiled models instead of redefining them:
+module.exports = mongoose.models.ModelName || mongoose.model("ModelName", schema);
+
+Apply this fix to all models:
+User.js
+Cart.js
+Artwork.js
+ABCFile.js
+Purchase.js
+...
+
+What it does for the system:
+- prevents duplicate model compilation
+- ensures all modules can safely import shared models
+- allows full application initialization without crashes
+- guarantees all routes are properly registered
+- eliminates false 404 errors caused by incomplete startup
+- stabilizes the modular architecture
+
+The issue was not a routing problem, but a startup failure:
+
+Model error → app initialization breaks → routes not registered → 404 errors
+
+Fixing the model handling restored:
+full server startup  
+proper route registration  
+onsistent API behavior  
+
+Before fix: App starts → loads routes → hits model error → crashes mid-initialization → some routes never get registered → 404 everywhere
+After fix: App starts → loads all models successfully → registers ALL routes → requests now match routes → no more 404
+
+4) Duplicate and fragmented search endpoints with inconsistent request handling
+
+Problem:
+The system originally implemented multiple search-related endpoints with overlapping functionality:
+/search-music-scores
+/advanced-search
+/search
+
+These endpoints:
+- duplicate query-building logic
+- handle similar filtering in different ways
+- use inconsistent request formats (GET with query params vs POST with body)
+- increase maintenance complexity (same logic repeated in multiple places)
+- create confusion for frontend integration (multiple endpoints for the same feature)
+
+This leads to poor API design, where a single resource (search) is unnecessarily split across multiple endpoints instead of being unified.
+
+Solution:
+Consolidate all search functionality into a **single endpoint per domain**, and standardize request handling:
+POST /api/search-music
+
+Refactor architecture into:
+router → controller → service → query builder
+- unify simple search (keyword) and advanced search (filters, combinedQueries)
+- centralize query logic into a reusable **query builder function**
+- standardize all inputs to be passed through **request body (POST)** instead of mixing query params and body
+
+Sidenote: Debugging GET → POST and params misuse
+
+During refactoring, an issue was encountered where:
+Search API returned results but did not apply filtering
+
+Root cause:
+- frontend was still sending data using:
+axios.post(url, {
+  params: { query: searchQuery }
+});
+
+This resulted in:
+req.body = { params: { query: "..." } }
+
+while backend expected:
+req.body.query
+
+Additionally, the original implementation used:
+GET → req.query
+
+but the refactored API used:
+POST → req.body
+
+Fix applied:
+axios.post(url, {
+  query: searchQuery
+});
+
+GET → use req.query (URL parameters)
+POST → use req.body (request payload)
+
+Mixing these incorrectly can cause:
+- filters not being applied
+- silent logic failures (no errors, but incorrect results)
+
+5) Separate filter endpoint causing duplicated logic and inconsistent data flow
+
+Problem:
+Filter functionality was implemented as a separate endpoint:
+/filter-music-scores
+
+This caused:
+- duplicated filtering logic (backend + frontend `applyFilters`)
+- inconsistent behavior (sometimes backend filter, sometimes frontend filter)
+- tight coupling between UI state and filtering logic
+- unnecessary API fragmentation (search vs filter treated differently)
+
+Solution:
+Merge filter logic into the unified search endpoint:
+POST /api/search-music
+
+Pass filters via request body:
+{ query, filters, combinedQueries }
+- remove `/filter-music-scores` endpoint
+- remove frontend `applyFilters` logic
+- centralize all filtering in backend query builder
+
+6) Misplaced ownership of purchase data (user module vs payment domain)
+
+Problem:
+Purchase-related endpoints were initially handled within the user context (e.g. `/user-purchases`), even though purchase data originates from transactions:
+/user-purchases
+/user-artwork-purchases
+
+This caused:
+- blurred responsibility between user and payment domains
+- tight coupling of user module with transactional logic
+- risk of creating a “god module” (user handling too many concerns)
+- unclear service boundaries for future microservices
+- weaker dependency modeling for system design and research
+
+Solution:
+Move purchase data ownership to the payment module, and let the user module act as a consumer/aggregator:
+payment → owns purchases
+user → retrieves purchases to build library view
+
+- refactor endpoints to originate from payment module
+- expose user-facing endpoints (e.g. `/user/library`) via user module
+- call payment service internally (or via HTTP after microservice migration)
+
+What it does for the system:
+- enforces clear domain ownership
+- prevents user module from becoming overloaded
+- prepares clean microservice boundaries
+- introduces meaningful service dependency (user → payment)
+
+Sidenote (important for microservices):
+
+Current:
+user.service → require(payment.service)  (in-process)
+
+After migration:
+user-service → HTTP call → payment-service
+
+This transforms a code-level dependency into a runtime service dependency
+
+7) Redundant payment fulfillment orchestration (frontend completion vs webhook fulfillment)
+
+Problem:
+Payment completion logic was partially implemented in two separate architectural flows:
+/complete-purchase-music
+/complete-purchase-artwork
+
+and:
+Stripe webhook → checkout.session.completed
+
+The frontend-triggered `complete-purchase` endpoints were performing the actual fulfillment responsibilities:
+- purchase insertion
+- duplicate cleanup
+- cart clearing
+- transaction completion
+
+Meanwhile, webhook fulfillment methods (`fulfillMusicOrder`, `fulfillArtworkOrder`) attempted to perform the same orchestration but relied on incomplete Stripe session item data (`session.display_items`).
+
+This caused:
+- partially duplicated orchestration design
+- unclear authoritative fulfillment flow
+- inconsistent payment architecture
+- race conditions during simultaneous testing
+- `VersionError` caused by concurrent cart modifications
+- confusion between event-driven and frontend-triggered fulfillment responsibilities
+
+Solution:
+Retain the `complete-purchase` endpoints as the authoritative fulfillment mechanism during the modular monolith phase, while simplifying the Stripe webhook into a verification/event-listening role.
+
+Current architecture:
+Stripe Checkout → Frontend success page → /complete-purchase endpoint → payment.service.js
+
+Refactoring actions:
+- centralize purchase fulfillment logic inside `payment.service.js`
+- retain frontend-triggered completion flow for stability
+- remove incomplete webhook fulfillment methods (`fulfillMusicOrder`, `fulfillArtworkOrder`)
+- consolidate duplicated cart-clearing logic into reusable helper methods
+- replace document-based cart updates (`save()`) with atomic `updateOne()` operations
+- simplify webhook responsibility to Stripe event verification and logging
+
+Sidenote (important for microservices):
+
+Current:
+payment module → direct model access (CartModel, PurchaseModel)
+
+After migration:
+payment-service → HTTP call → music-service/arts-service
+
+Future enhancement:
+Stripe webhook → payment-service event orchestration
+
+can later evolve into a fully event-driven fulfillment architecture after microservice migration.
+
+8) Direct frontend-to-AI service coupling (bypassing backend orchestration)
+
+Problem:
+The frontend originally called FastAPI inference services directly:
+Frontend
+   ↓
+http://127.0.0.1:5173/predict-emotion
+
+instead of routing through the Node.js backend AI module.
+
+This caused:
+- frontend awareness of internal AI service topology
+- tight coupling between frontend and FastAPI ports/endpoints
+- bypassing of backend orchestration layer
+- duplicated infrastructure knowledge across frontend
+- weaker separation of concerns
+- inconsistent API architecture compared to other modules
+- inability to centralize AI request handling, logging, retries, or security
+
+Solution:
+Introduce the Node.js AI module as an orchestration/gateway layer between the frontend and FastAPI inference services.
+
+Refactoring actions:
+- create dedicated AI module (`ai.routes.js`, `ai.controller.js`, `ai.service.js`)
+- move FastAPI endpoint configuration into `ai.constants.js`
+- centralize axios-based AI inference orchestration inside `ai.service.js`
+- update frontend to call backend AI endpoints instead of FastAPI directly
+- isolate external AI service communication behind backend APIs
+
+Current architecture:
+Frontend
+   ↓
+Node.js AI module
+   ↓
+FastAPI inference services
+   ↓
+TensorFlow models
+
+
+instead of:
+Frontend
+   ↓
+FastAPI inference services
+
+What it does for the system:
+- centralizes AI orchestration logic
+- hides internal AI infrastructure from frontend
+- improves separation of concerns
+- prepares API gateway-style architecture
+- simplifies frontend/backend dependency management
+- improves scalability and maintainability
+- enables centralized monitoring, retries, caching, and security handling
+
+Sidenote (important for microservices):
+
+Current:
+Node.js AI module
+↓ HTTP
+FastAPI AI services
+
+After migration:
+API Gateway / AI Orchestrator Service
+↓
+distributed AI inference microservices
+
+This creates a cleaner service dependency graph and prepares the system for Kubernetes-based orchestration and independently scalable AI inference services.
+
+8.1) AI Models Deployment Pipeline
+
+The AI inference architecture was redesigned into a service-oriented deployment pipeline to improve modularity and future microservice scalability.
+
+Current architecture:
+Frontend
+   ↓
+Node.js Backend (API Gateway / Orchestrator)
+   ↓
+FastAPI AI Services
+   ↓
+TensorFlow Models (.h5)
+The frontend no longer communicates directly with the AI models. Instead, prediction requests are routed through the Node.js backend, which acts as an orchestration layer responsible for forwarding requests to the appropriate AI inference service.
+
+Each AI model operates as an independent FastAPI service:
+
+* Emotion prediction service
+* Genre prediction service
+* Gender prediction service
+
+Each service:
+
+* runs on its own port
+* loads its TensorFlow `.h5` model into memory during startup
+* exposes REST API endpoints for prediction requests
+
+During local development, the FastAPI services are executed independently through separate Python processes, simulating a distributed microservice deployment environment.
+
+BONUS: Simulation of Distributed Cloud Environment
+
+During development, there are multiple independent services running on separate ports, for example:
+Frontend          → localhost:5173
+Node Backend      → localhost:10000
+Emotion Service   → localhost:8002
+Genre Service     → localhost:8001
+Gender Service    → localhost:8003
+
+Each terminal represents:
+- an independent runtime
+- an isolated process
+- a separate service instance
+and they communicate with each other through HTTP requests.
+
+In cloud deployment terms, the local machine is currently simulating multiple deployed backend services
+similar to:
+Frontend container
+Backend API container
+Emotion AI container
+Genre AI container
+Gender AI container
+
+running separately in:
+- Docker containers
+- VMs
+- Kubernetes pods
+- cloud services
+
+
+# What makes this “microservice-like”
+| Characteristic                | Present? |
+| ----------------------------- | -------- |
+| Separate processes            | ✅        |
+| Separate ports                | ✅        |
+| HTTP communication            | ✅        |
+| Independent service startup   | ✅        |
+| Isolated runtime environments | ✅        |
+| Backend orchestration         | ✅        |
+
+This is fundamentally how distributed systems operate.
+
+# What changes in actual cloud deployment
+
+Locally:
+localhost:8002
+
+In cloud:
+https://emotion-service.up.railway.app
+
+or internal container networking.
+
+But architecturally, the communication pattern is the same.
+
+9) Soft-delete inconsistency in dynamic field management
+
+Problem:
+The dynamic field system used soft deletion through the `isActive` flag.
+However, the frontend only fetched active fields:
+GET /dynamic-fields
+→ returns only isActive: true
+
+When a field was deactivated:
+- it disappeared from the frontend immediately
+- but still existed in the database
+- clerks could no longer reactivate the field through the UI
+
+This created inconsistent behavior where deactivated fields behaved like permanently deleted fields in the frontend, despite still existing in MongoDB.
+
+Solution:
+Introduce optional inactive field retrieval for admin management views.
+
+Refactoring actions:
+- modify `getArtsDynamicFields()` and `getMusicDynamicFields` to support:
+  `?showInactive=true`
+- update the frontend field manager to request all fields
+- retain active-only filtering for normal artwork forms
+- keep inactive fields visible and toggleable in the admin UI
+
+Current behavior:
+- admin field manager → shows active + inactive fields
+- artwork forms → show active fields only
+- deactivated fields can now be reactivated directly from the frontend
+
+What it does for the system:
+- implements proper soft-delete behavior
+- prevents hidden unrecoverable records
+- improves usability
+- aligns frontend and backend data semantics
+- creates more consistent field lifecycle management
+
+10) Replacing unstable Windows-based xml2abc CLI conversion with a Python-based MusicXML parser and converter
+
+Problem:
+The original pipeline attempted to convert `.mxl` files into `.abc` notation using the Node.js `xml2abc` CLI package:
+Audiveris → xml2abc CLI → ABC
+
+This caused multiple issues on Windows:
+- `xml2abc` executable not recognized
+- `npx` spawning failures (`ENOENT`, `EINVAL`)
+- shell parsing problems with file paths
+- `.cmd` execution inconsistencies
+- async timing issues causing `.abc` files to be read before creation
+- dependency instability across environments
+- unreliable child process execution in Node.js
+
+This resulted in:
+- failed ABC conversion despite successful Audiveris OCR
+- inconsistent cross-platform behavior
+- fragile orchestration pipeline
+- excessive debugging overhead related to shell execution instead of actual music processing
+
+Solution:
+Replace the external CLI-based conversion step with a custom Python-based MusicXML parser and ABC generator.
+
+Current architecture:
+Audiveris → Python MusicXML Parser → ABC
+
+
+Refactoring actions:
+- remove dependency on Node.js `xml2abc`
+- create custom `musicxml_to_abc.py`
+- use Python `zipfile` to extract `.mxl` archives
+- parse MusicXML directly using `xml.etree.ElementTree`
+- generate ABC notation internally from parsed notes/rests/durations
+- invoke Python script from Node.js backend through controlled subprocess execution
+- support both `.mxl` and plain `.xml` MusicXML formats
+
+What it does for the system:
+- eliminates unstable Windows CLI execution issues
+- removes dependency on `npx` and shell-specific behavior
+- improves cross-platform reliability
+- centralizes notation conversion logic into a controlled implementation
+- provides cleaner error handling and debugging
+- improves maintainability and extensibility of the music processing pipeline
+- stabilizes end-to-end OCR → MusicXML → ABC conversion
+
+Current processing pipeline:
+Uploaded PDF/Image
+        ↓
+Audiveris OCR
+        ↓
+MusicXML (.mxl)
+        ↓
+Python conversion service
+        ↓
+ABC notation (.abc)
+        ↓
+MongoDB storage
+
+Sidenote (important for future microservices):
+
+Current:
+Node.js backend
+↓ subprocess
+Python conversion script
+
+After migration:
+music-processing-service
+↓
+dedicated notation-conversion microservice
+
+11) Refactoring frontend-managed Firebase uploads into backend-managed upload architecture
+
+Problem:
+The original system allowed multiple frontend components to directly interact with Firebase Storage using the Firebase SDK:
+Frontend → Firebase Storage → Backend Database Update
+
+This caused several architectural issues:
+- Firebase logic duplicated across many frontend components
+- frontend tightly coupled to Firebase implementation
+- upload logic scattered throughout the UI layer
+- difficult to maintain and debug upload-related issues
+- storage provider could not be changed without modifying frontend code
+- inconsistent upload handling between modules
+
+This resulted in:
+- poor separation of concerns
+- increased frontend complexity
+- duplicated upload code across profile, arts, and music modules
+- limited scalability for future microservices migration
+
+Solution:
+Refactor the upload flow so that all uploads are handled centrally by the backend using a shared upload service.
+
+Current architecture:
+Frontend
+↓
+Backend Upload Endpoint
+↓
+Shared Upload Service
+↓
+Firebase Storage
+↓
+MongoDB Update
+
+Refactoring actions:
+- create centralized `shared/upload` infrastructure
+- implement reusable `upload.middleware.js` using Multer
+- implement reusable `upload.service.js` for Firebase uploads
+- create backend-managed upload endpoints inside modules
+- remove direct Firebase upload calls from frontend components
+- replace frontend `uploadBytes()` and `getDownloadURL()` usage with API requests
+- refactor profile picture upload flow into `/user/upload-profile-picture`
+- reuse existing `updateProfilePicture()` service logic to avoid duplication
+
+What it does for the system:
+- centralizes upload logic into backend infrastructure
+- improves modular monolith architecture
+- reduces frontend complexity
+- decouples frontend from Firebase implementation
+- improves maintainability and scalability
+- prepares system for future migration to other storage providers (e.g. S3, local storage)
+- aligns upload architecture with future microservices design
+
+Current upload pipeline:
+Frontend File Upload
+↓
+Backend API Endpoint
+↓
+Shared Upload Service
+↓
+Firebase Storage
+↓
+MongoDB Database Update
+
+Sidenote (important for future microservices):
+
+Current:
+Frontend
+↓
+Node.js backend upload service
+↓
+Firebase Storage
+
+After migration:
+API Gateway
+↓
+dedicated file-upload microservice
+↓
+cloud storage provider
